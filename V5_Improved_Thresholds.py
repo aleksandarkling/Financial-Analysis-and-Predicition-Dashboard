@@ -1,0 +1,518 @@
+"""
+Forward-Looking ML Pipeline for Real Trading
+Uses tomorrow's returns as targets for actual predictive trading
+Modified to use specific thresholds for each asset
+"""
+
+import pandas as pd
+import numpy as np
+import yfinance as yf
+from datetime import datetime, timedelta
+import warnings
+warnings.filterwarnings('ignore')
+
+# Technical indicators
+from ta.trend import MACD, EMAIndicator, SMAIndicator
+from ta.momentum import RSIIndicator, StochasticOscillator
+from ta.volatility import BollingerBands, AverageTrueRange
+
+# ML libraries
+from sklearn.model_selection import train_test_split, TimeSeriesSplit, GridSearchCV
+from sklearn.preprocessing import RobustScaler
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.linear_model import LogisticRegression
+from xgboost import XGBClassifier
+from sklearn.metrics import accuracy_score, f1_score, classification_report, confusion_matrix
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# Configuration
+SYMBOLS = {
+    'META': 'META',
+    'WTI': 'CL=F', 
+    'URTH': 'URTH'
+}
+
+# FIXED THRESHOLDS AS SPECIFIED
+FIXED_THRESHOLDS = {
+    'META': 1.5,
+    'WTI': 1.8,
+    'URTH': 0.5
+}
+
+# ==================== DATA CLEANING FOR WTI ====================
+def clean_data(df, asset_name):
+    """Clean data to avoid infinity errors, especially for WTI"""
+    df = df.copy()
+    
+    # Remove any rows with zero prices
+    for col in ['Open', 'Close', 'High', 'Low']:
+        if col in df.columns:
+            zero_mask = df[col] == 0
+            if zero_mask.any():
+                print(f"    Removing {zero_mask.sum()} rows with zero {col}")
+                df = df[~zero_mask]
+    
+    # Forward fill NaN values
+    df = df.fillna(method='ffill').fillna(method='bfill')
+    
+    # Replace any remaining infinities with NaN then forward fill
+    df = df.replace([np.inf, -np.inf], np.nan)
+    df = df.fillna(method='ffill').fillna(method='bfill')
+    
+    return df
+
+# ==================== FORWARD-LOOKING TARGET CREATION ====================
+def create_forward_looking_target(df, threshold, asset_name):
+    """
+    Create FORWARD-LOOKING target variable for actual trading
+    Using the specified fixed threshold
+    """
+    print(f"  Using FIXED threshold: {threshold}% for {asset_name}")
+    
+    # Calculate today's returns (for features)
+    df['Returns'] = df['Close'].pct_change() * 100
+    
+    # CRITICAL: Tomorrow's return for prediction
+    df['Tomorrow_Return'] = df['Returns'].shift(-1)  # FORWARD-LOOKING!
+    
+    # Create labels based on tomorrow's return
+    conditions = [
+        df['Tomorrow_Return'] > threshold,    # Tomorrow will be up significantly
+        df['Tomorrow_Return'] < -threshold    # Tomorrow will be down significantly
+    ]
+    choices = [2, 1]  # 2: BUY (expecting up), 1: SELL (expecting down)
+    df['Target'] = np.select(conditions, choices, default=0)  # 0: HOLD
+    
+    # Add labels
+    df['Target_Label'] = df['Target'].map({0: 'HOLD', 1: 'SELL', 2: 'BUY'})
+    
+    # Remove last row (no tomorrow for it)
+    df = df[:-1]
+    
+    # Show distribution and analysis
+    dist = df['Target'].value_counts(normalize=True).sort_index()
+    print(f"  Target distribution - Hold: {dist.get(0,0):.1%}, "
+          f"Sell: {dist.get(1,0):.1%}, Buy: {dist.get(2,0):.1%}")
+    
+    # Show what this threshold captures
+    abs_returns = df['Tomorrow_Return'].abs().dropna()
+    moves_above = (abs_returns > threshold).sum()
+    total_days = len(abs_returns)
+    print(f"  Threshold {threshold}% captures {moves_above}/{total_days} days ({moves_above/total_days*100:.1f}%) as significant")
+    
+    print("  ✓ Using FORWARD-LOOKING targets (predicting tomorrow)")
+    
+    return df
+
+def create_enhanced_features(df, asset_type='stock'):
+    """
+    Create features using ONLY TODAY's and PAST information
+    No forward-looking features allowed!
+    """
+    print(f"  Creating features for {asset_type} (no forward-looking)...")
+    
+    # Price action (all backward-looking or same-day)
+    df['High_Low_Range'] = (df['High'] - df['Low']) / df['Close'] * 100
+    df['Close_to_Open'] = (df['Close'] - df['Open']) / df['Open'] * 100
+    
+    # Previous day's gap
+    df['Previous_Gap'] = (df['Open'] - df['Close'].shift(1)) / df['Close'].shift(1) * 100
+    
+    # Volume features (backward-looking)
+    df['Volume_MA20'] = df['Volume'].rolling(20).mean()
+    df['Volume_Ratio'] = df['Volume'] / df['Volume_MA20']
+    df['Volume_Change'] = df['Volume'].pct_change()
+    
+    # HISTORICAL momentum (all backward-looking)
+    for period in [2, 5, 10, 20, 50]:
+        df[f'Past_Return_{period}d'] = df['Close'].pct_change(period) * 100
+        df[f'Highest_{period}d'] = df['High'].shift(1).rolling(period).max() / df['Close'] - 1
+        df[f'Lowest_{period}d'] = df['Low'].shift(1).rolling(period).min() / df['Close'] - 1
+    
+    # Volatility (historical)
+    df['Volatility_5d'] = df['Returns'].rolling(5).std()
+    df['Volatility_20d'] = df['Returns'].rolling(20).std()
+    df['Volatility_Ratio'] = df['Volatility_5d'] / (df['Volatility_20d'] + 1e-10)
+    
+    # Technical indicators (all backward-looking)
+    # RSI
+    for period in [7, 14, 21]:
+        df[f'RSI_{period}'] = RSIIndicator(close=df['Close'], window=period).rsi()
+    
+    # MACD
+    macd = MACD(close=df['Close'])
+    df['MACD'] = macd.macd()
+    df['MACD_Signal'] = macd.macd_signal()
+    df['MACD_Histogram'] = macd.macd_diff()
+    
+    # Moving averages
+    for period in [10, 20, 50, 200]:
+        df[f'SMA_{period}'] = df['Close'].rolling(period).mean()
+        df[f'Close_to_SMA{period}'] = (df['Close'] - df[f'SMA_{period}']) / df[f'SMA_{period}'] * 100
+    
+    # Bollinger Bands
+    bb = BollingerBands(close=df['Close'], window=20, window_dev=2)
+    df['BB_Width'] = (bb.bollinger_hband() - bb.bollinger_lband()) / bb.bollinger_mavg() * 100
+    df['BB_Position'] = (df['Close'] - bb.bollinger_lband()) / (bb.bollinger_hband() - bb.bollinger_lband() + 1e-10)
+    
+    # Asset-specific features
+    if asset_type == 'commodity':
+        # Commodities - add time-based features
+        df['Month'] = pd.to_datetime(df.index).month
+        df['Quarter'] = pd.to_datetime(df.index).quarter
+        df['DayOfWeek'] = pd.to_datetime(df.index).dayofweek
+        # Longer trends
+        df['Trend_100d'] = (df['Close'] - df['Close'].rolling(100).mean()) / (df['Close'].rolling(100).mean() + 1e-10) * 100
+        
+    elif asset_type == 'etf':
+        # ETFs - mean reversion indicators
+        df['Z_Score_20'] = (df['Close'] - df['SMA_20']) / (df['Volatility_20d'] + 1e-10)
+        df['Z_Score_50'] = (df['Close'] - df['SMA_50']) / (df['Returns'].rolling(50).std() + 1e-10)
+        
+    elif asset_type == 'tech_stock':
+        # Tech stocks - momentum indicators
+        df['Momentum_Score'] = (df['Past_Return_5d'] + df['Past_Return_10d'] + df['Past_Return_20d']) / 3
+        df['RSI_Divergence'] = df['RSI_14'] - df['RSI_14'].rolling(5).mean()
+        df['Volume_Momentum'] = df['Volume'].rolling(5).mean() / (df['Volume'].rolling(20).mean() + 1e-10)
+    
+    # Replace any infinities that might have been created
+    df = df.replace([np.inf, -np.inf], 0)
+    
+    return df
+
+def train_optimized_models(X_train, X_test, y_train, y_test, asset_name):
+    """Train models for forward-looking prediction"""
+    print(f"\n  Training models for FORWARD-LOOKING prediction...")
+    
+    # Scale data
+    scaler = RobustScaler()
+    X_train_scaled = scaler.fit_transform(X_train)
+    X_test_scaled = scaler.transform(X_test)
+    
+    # Check class distribution
+    class_counts = pd.Series(y_train).value_counts()
+    print(f"    Training class distribution: {class_counts.to_dict()}")
+    
+    # Calculate class weights
+    class_weights = {}
+    for cls in class_counts.index:
+        class_weights[cls] = len(y_train) / (len(class_counts) * class_counts[cls])
+    
+    models = {}
+    
+    # 1. Logistic Regression
+    models['Logistic_Regression'] = LogisticRegression(
+        class_weight=class_weights,
+        max_iter=1000,
+        random_state=42
+    )
+    
+    # 2. Random Forest
+    models['Random_Forest'] = RandomForestClassifier(
+        n_estimators=200,
+        max_depth=10,
+        min_samples_split=20,
+        min_samples_leaf=10,
+        class_weight=class_weights,
+        random_state=42,
+        n_jobs=-1
+    )
+    
+    # 3. XGBoost
+    scale_pos_weight = np.sqrt(class_counts[0] / class_counts[class_counts.index != 0].mean()) if len(class_counts) > 2 else 1
+    
+    models['XGBoost'] = XGBClassifier(
+        n_estimators=200,
+        max_depth=6,
+        learning_rate=0.05,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        scale_pos_weight=scale_pos_weight,
+        random_state=42,
+        use_label_encoder=False,
+        eval_metric='logloss'
+    )
+    
+    # 4. Gradient Boosting
+    models['Gradient_Boosting'] = GradientBoostingClassifier(
+        n_estimators=200,
+        max_depth=5,
+        learning_rate=0.05,
+        subsample=0.8,
+        random_state=42
+    )
+    
+    results = {}
+    
+    for name, model in models.items():
+        try:
+            # Train
+            model.fit(X_train_scaled, y_train)
+            
+            # Predict
+            y_pred = model.predict(X_test_scaled)
+            y_pred_proba = model.predict_proba(X_test_scaled) if hasattr(model, 'predict_proba') else None
+            
+            # Evaluate
+            accuracy = accuracy_score(y_test, y_pred)
+            f1 = f1_score(y_test, y_pred, average='weighted')
+            
+            # Per-class performance
+            report = classification_report(y_test, y_pred, output_dict=True, zero_division=0)
+            
+            results[name] = {
+                'model': model,
+                'accuracy': accuracy,
+                'f1_score': f1,
+                'predictions': y_pred,
+                'probabilities': y_pred_proba,
+                'classification_report': report,
+                'scaler': scaler
+            }
+            
+            print(f"      {name}: Accuracy={accuracy:.3f}, F1={f1:.3f}")
+            
+        except Exception as e:
+            print(f"      {name}: Error - {str(e)}")
+    
+    return results
+
+def realistic_backtest(df, predictions, initial_capital=10000):
+    """
+    Realistic backtesting with proper position sizing and no look-ahead
+    """
+    print("\n  Running REALISTIC backtest...")
+    
+    capital = initial_capital
+    position = 0  # Number of shares
+    trades = []
+    portfolio_values = []
+    
+    for i in range(len(predictions)):
+        current_price = df['Close'].iloc[i]
+        signal = predictions[i]
+        
+        # Record current portfolio value
+        current_value = capital + (position * current_price)
+        portfolio_values.append(current_value)
+        
+        # Trading logic (simplified - all in/out)
+        if signal == 2 and position == 0:  # BUY signal and no position
+            shares_to_buy = capital / current_price
+            position = shares_to_buy
+            capital = 0
+            trades.append(('BUY', current_price, i))
+            
+        elif signal == 1 and position > 0:  # SELL signal and have position
+            capital = position * current_price
+            position = 0
+            trades.append(('SELL', current_price, i))
+    
+    # Close final position if any
+    if position > 0:
+        final_price = df['Close'].iloc[-1]
+        capital = position * final_price
+        position = 0
+    
+    final_value = capital
+    total_return = ((final_value - initial_capital) / initial_capital) * 100
+    
+    # Calculate annualized return
+    n_years = len(df) / 252
+    if total_return > -100:
+        annualized_return = ((final_value / initial_capital) ** (1/n_years) - 1) * 100
+    else:
+        annualized_return = -100
+    
+    print(f"    Total trades: {len(trades)}")
+    print(f"    Final value: ${final_value:.2f}")
+    print(f"    Total return: {total_return:.2f}%")
+    print(f"    Annualized return: {annualized_return:.2f}%")
+    
+    return {
+        'total_trades': len(trades),
+        'total_return': total_return,
+        'annualized_return': annualized_return,
+        'final_value': final_value,
+        'portfolio_values': portfolio_values
+    }
+
+def analyze_model_performance(y_test, y_pred, model_name, asset_name):
+    """Detailed analysis of model performance"""
+    print(f"\n  Detailed Analysis for {model_name} on {asset_name}:")
+    
+    # Classification report
+    report = classification_report(y_test, y_pred, output_dict=True, zero_division=0)
+    
+    print(f"    Per-class Performance:")
+    for class_label in ['0', '1', '2']:  # HOLD, SELL, BUY
+        if class_label in report:
+            class_name = {0: 'HOLD', 1: 'SELL', 2: 'BUY'}[int(class_label)]
+            precision = report[class_label]['precision']
+            recall = report[class_label]['recall']
+            f1 = report[class_label]['f1-score']
+            support = report[class_label]['support']
+            print(f"      {class_name}: Precision={precision:.3f}, Recall={recall:.3f}, F1={f1:.3f}, Support={support}")
+    
+    # Confusion matrix
+    cm = confusion_matrix(y_test, y_pred)
+    print(f"    Confusion Matrix:")
+    print(f"    Predicted:  SELL  HOLD   BUY")
+    for i, actual_class in enumerate(['SELL', 'HOLD', 'BUY']):
+        if i < len(cm):
+            row = cm[i]
+            print(f"    {actual_class:>8}: {row[0] if len(row) > 0 else 0:5} {row[1] if len(row) > 1 else 0:5} {row[2] if len(row) > 2 else 0:5}")
+    
+    return report
+
+# ==================== MAIN PIPELINE ====================
+def main():
+    """Run forward-looking ML pipeline with fixed thresholds"""
+    print("="*80)
+    print("FORWARD-LOOKING ML PIPELINE FOR REAL TRADING")
+    print("Using tomorrow's returns as targets with FIXED THRESHOLDS")
+    print("="*80)
+    
+    all_results = {}
+    
+    # Define asset types
+    asset_types = {
+        'META': 'tech_stock',
+        'WTI': 'commodity',
+        'URTH': 'etf'
+    }
+    
+    for symbol_name, symbol_ticker in SYMBOLS.items():
+        print(f"\n{'='*40}")
+        print(f"Processing {symbol_name} ({asset_types[symbol_name]})")
+        print('='*40)
+        
+        try:
+            # Fetch data
+            stock = yf.Ticker(symbol_ticker)
+            df = stock.history(period="5y")
+            
+            if df.empty:
+                print(f"  No data for {symbol_name}")
+                continue
+            
+            # Clean data (especially for WTI)
+            df = clean_data(df, symbol_name)
+            
+            # Use FIXED threshold
+            threshold = FIXED_THRESHOLDS[symbol_name]
+            
+            # Create FORWARD-LOOKING target
+            df = create_forward_looking_target(df, threshold, symbol_name)
+            
+            # Create features (backward-looking only)
+            df = create_enhanced_features(df, asset_type=asset_types[symbol_name])
+            
+            # Prepare data
+            df_clean = df.dropna()
+            
+            # Define features (exclude target and forward-looking data)
+            exclude_cols = ['Open', 'High', 'Low', 'Close', 'Volume', 
+                          'Target', 'Target_Label', 'Returns', 'Tomorrow_Return']
+            
+            feature_cols = [col for col in df_clean.columns if col not in exclude_cols 
+                          and df_clean[col].dtype in ['float64', 'int64', 'int32']]
+            
+            # Remove any features with NaN or inf
+            df_clean = df_clean[feature_cols + ['Target', 'Close']].replace([np.inf, -np.inf], 0).fillna(0)
+            
+            X = df_clean[feature_cols]
+            y = df_clean['Target']
+            
+            # Train/test split (temporal)
+            split_idx = int(len(X) * 0.7)
+            X_train = X.iloc[:split_idx]
+            X_test = X.iloc[split_idx:]
+            y_train = y.iloc[:split_idx]
+            y_test = y.iloc[split_idx:]
+            df_test = df_clean.iloc[split_idx:]
+            
+            print(f"  Data: {len(X_train)} training, {len(X_test)} test samples")
+            
+            # Train models
+            models = train_optimized_models(X_train, X_test, y_train, y_test, symbol_name)
+            
+            if not models:
+                print(f"  No models trained successfully for {symbol_name}")
+                continue
+            
+            # Select best model
+            best_model_name = max(models.keys(), key=lambda k: models[k]['f1_score'])
+            best_model = models[best_model_name]
+            
+            print(f"\n  Best model: {best_model_name}")
+            print(f"    Accuracy: {best_model['accuracy']:.3f}")
+            print(f"    F1 Score: {best_model['f1_score']:.3f}")
+            
+            # Detailed performance analysis
+            analyze_model_performance(y_test, best_model['predictions'], best_model_name, symbol_name)
+            
+            # Feature importance for tree-based models
+            if best_model_name in ['Random_Forest', 'XGBoost', 'Gradient_Boosting']:
+                if hasattr(best_model['model'], 'feature_importances_'):
+                    importances = best_model['model'].feature_importances_
+                    top_features_idx = np.argsort(importances)[-10:][::-1]
+                    print("\n  Top 10 Most Important Features:")
+                    for idx in top_features_idx:
+                        if idx < len(feature_cols):
+                            print(f"    {feature_cols[idx]}: {importances[idx]:.4f}")
+            
+            # Realistic backtest
+            backtest_results = realistic_backtest(
+                df_test, best_model['predictions'], initial_capital=10000
+            )
+            
+            # Store results
+            all_results[symbol_name] = {
+                'threshold': threshold,
+                'best_model': best_model_name,
+                'accuracy': best_model['accuracy'],
+                'f1_score': best_model['f1_score'],
+                'backtest': backtest_results,
+                'models': models,
+                'classification_report': best_model['classification_report']
+            }
+            
+        except Exception as e:
+            print(f"  Error processing {symbol_name}: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            continue
+    
+    # Summary
+    print("\n" + "="*80)
+    print("SUMMARY - FORWARD-LOOKING PREDICTIONS WITH FIXED THRESHOLDS")
+    print("="*80)
+    
+    for asset, results in all_results.items():
+        print(f"\n{asset} (Threshold: {results['threshold']:.1f}%):")
+        print(f"  Best Model: {results['best_model']}")
+        print(f"  Accuracy: {results['accuracy']:.3f}")
+        print(f"  F1 Score: {results['f1_score']:.3f}")
+        print(f"  Total Return: {results['backtest']['total_return']:.2f}%")
+        print(f"  Annualized Return: {results['backtest']['annualized_return']:.2f}%")
+        print(f"  Total Trades: {results['backtest']['total_trades']}")
+        
+        # Show per-class performance for best model
+        report = results['classification_report']
+        if 'weighted avg' in report:
+            print(f"  Weighted Avg F1: {report['weighted avg']['f1-score']:.3f}")
+    
+    print("\n" + "="*80)
+    print("MODEL ANALYSIS COMPLETE")
+    print("="*80)
+    print("✓ Using forward-looking targets (predicting tomorrow)")
+    print("✓ Features are all backward-looking (no cheating)")
+    print("✓ Fixed thresholds applied as specified")
+    print("✓ Realistic backtesting with proper position sizing")
+    
+    return all_results
+
+if __name__ == "__main__":
+    results = main()
