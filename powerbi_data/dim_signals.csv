@@ -1,0 +1,4 @@
+SignalID,Description,Color,Action
+BUY,Buy Signal,#00FF00,1
+SELL,Sell Signal,#FF0000,-1
+HOLD,Hold Position,#808080,0

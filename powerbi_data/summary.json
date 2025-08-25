@@ -1,0 +1,25 @@
+{
+  "last_update": "2025-08-23T17:36:29.489349",
+  "assets_processed": [
+    "META",
+    "WTI",
+    "URTH"
+  ],
+  "predictions": {
+    "META": {
+      "signal": "HOLD",
+      "price": 739.0999755859375,
+      "accuracy": 0.6885245901639344
+    },
+    "WTI": {
+      "signal": "HOLD",
+      "price": 63.52000045776367,
+      "accuracy": 0.639344262295082
+    },
+    "URTH": {
+      "signal": "HOLD",
+      "price": 173.9600067138672,
+      "accuracy": 0.5245901639344263
+    }
+  }
+}
